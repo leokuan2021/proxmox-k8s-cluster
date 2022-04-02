@@ -1,0 +1,252 @@
+---
+- hosts: masters,workers
+  remote_user: devops
+  become: yes
+  become_user: root
+  become_method: sudo
+  gather_facts: yes
+
+  tasks:
+    - name: update hosts files in each node, need a better way of doing this
+      shell: |
+        echo "192.168.1.140  k8s-master" >> /etc/hosts
+        echo "192.168.1.146  k8s-worker0" >> /etc/hosts
+        echo "192.168.1.147  k8s-worker1" >> /etc/hosts
+
+    - name: disable firewall to make it easy for now
+      shell: sudo ufw disable
+
+    - name: disable swap
+      shell: |
+        sudo swapoff -a
+        sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+    - name: allow iptables see bridge traffic
+      copy:
+        dest: "/etc/modules-load.d/k8s.conf"
+        content: |
+          br_netfilter
+
+    - name: more bridge traffic stuff
+      copy:
+        dest: "/etc/sysctl.d/k8s.conf"
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+
+    - name: apply new settings
+      shell: sudo sysctl --system
+
+    - name: containerd pre-install config
+      copy:
+        dest: "/etc/modules-load.d/containerd.conf"
+        content: |
+          overlay
+          br_netfilter
+
+    - name: modprobe
+      shell: |
+        sudo modprobe overlay
+        sudo modprobe br_netfilter
+
+    - name: sysctl params setup
+      copy:
+        dest: "/etc/sysctl.d/99-kubernetes-cri.conf"
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.ipv4.ip_forward                 = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+
+    - name: apply new settings, again
+      shell: sudo sysctl --system
+
+    - name: install containerd only when the apt process isn't locked
+      apt:
+        name: containerd
+        state: present
+      register: apt_action
+      retries: 100
+      until: apt_action is success or ('Failed to lock apt for exclusive operation' not in apt_action.msg and '/var/lib/dpkg/lock' not in apt_action.msg)
+
+    - name: configure and start containerd
+      shell: |
+        sudo mkdir -p /etc/containerd
+        containerd config default | sudo tee /etc/containerd/config.toml
+        sudo systemctl restart containerd
+        sudo apt-get update
+
+    - name: install k8 dependencies only when the apt process isn't locked
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+        state: present
+      register: apt_action
+      retries: 100
+      until: apt_action is success or ('Failed to lock apt for exclusive operation' not in apt_action.msg and '/var/lib/dpkg/lock' not in apt_action.msg)
+
+    - name: configure dependencies and add k8 repos
+      shell: |
+        sudo curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | sudo tee /etc/apt/sources.list.d/kubernetes.list 
+        sudo apt-get update
+
+    - name: install kubelet, kubeadm and kubectl only when the apt process isn't locked
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+      register: apt_action
+      retries: 100
+      until: apt_action is success or ('Failed to lock apt for exclusive operation' not in apt_action.msg and '/var/lib/dpkg/lock' not in apt_action.msg)
+
+    - name: pin kubelet, kubeadm and kubectl versions
+      shell: sudo apt-mark hold kubelet kubeadm kubectl
+
+- hosts: masters
+  become: yes
+
+  tasks:
+    - name: initialize cluster with kubeadm on master node
+      shell: sudo kubeadm init --control-plane-endpoint 192.168.1.140:6443 --pod-network-cidr 192.168.152.0/23
+
+    - name: setup kubectl access as normal user
+      become: yes
+      become_user: devops
+      shell: |
+        mkdir -p $HOME/.kube
+        sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+        sudo chown $(id -u):$(id -g) $HOME/.kube/config
+        echo 'source <(kubectl completion bash)' >> ~/.bashrc
+        echo 'alias k=kubectl' >> ~/.bashrc
+        echo 'complete -F __start_kubectl k' >> ~/.bashrc
+        mkdir -p ~/.docker/cli-plugins/
+        curl -SL https://github.com/docker/compose/releases/download/v2.2.3/docker-compose-linux-x86_64 -o ~/.docker/cli-plugins/docker-compose
+        chmod +x ~/.docker/cli-plugins/docker-compose
+
+    - name: setup CNI, calico
+      become: yes
+      become_user: devops
+      shell: |
+        mkdir $HOME/calico
+        cd calico
+        curl https://projectcalico.docs.tigera.io/manifests/calico.yaml -O
+        kubectl apply -f calico.yaml
+        cd $HOME
+   
+    - name: generate the token for joining the worker nodes
+      become: yes
+      become_user: devops
+      shell: kubeadm token create  --print-join-command
+      register: kubernetes_join_command
+
+    - name: write join command to a file
+      become: yes
+      copy:
+        dest: "/tmp/kubernetes_join_command.sh" 
+        content: "{{ kubernetes_join_command.stdout_lines[0] }}"
+
+    - name: fetch join command file to the deploying machine 
+      become: yes
+      ansible.builtin.fetch: 
+        src: "/tmp/kubernetes_join_command.sh"
+        dest: "/tmp/kubernetes_join_command.sh"
+        flat: yes
+
+    - name: install helm from apt
+      become: yes
+      become_user: devops
+      shell: |
+        sudo apt update
+        sudo apt --yes install software-properties-common
+        sudo add-apt-repository --yes --update ppa:ansible/ansible
+        sudo apt --yes install ansible
+        wget https://github.com/kubernetes/kompose/releases/download/v1.26.1/kompose_1.26.1_amd64.deb
+        sudo apt --yes install ./kompose_1.26.1_amd64.deb
+        rm kompose_1.26.1_amd64.deb
+  
+- hosts: workers
+  become: yes
+
+  tasks:
+    - name: copy k8 cluster join code into worker nodes
+      become: yes
+      copy:
+        src: /tmp/kubernetes_join_command.sh
+        dest: /tmp/kubernetes_join_command.sh
+        owner: root
+        mode: 0777
+
+    - name: join the Worker nodes to the cluster.
+      become: yes
+      become_user: devops
+      shell: sudo sh /tmp/kubernetes_join_command.sh
+      register: joined_or_not
+
+
+- name: install Docker
+  hosts: masters,workers
+  become: yes
+  tasks:
+    - name: Install apt-transport-https
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - lsb-release
+          - gnupg
+        state: latest
+        update_cache: true
+
+    - name: Add signing key
+      ansible.builtin.apt_key:
+        url: "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
+        state: present
+    - name: Get OS release name
+      command: "lsb_release -cs"
+      changed_when: false
+      register: lsb_rel
+    - name: Add repository into sources list
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ lsb_rel.stdout }} stable"
+        state: present
+
+    - name: Install Docker
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: latest
+        update_cache: true
+
+    - name: install helm from apt
+      become: yes
+      become_user: devops
+      shell: |
+        sudo apt-get update
+        sudo apt-get --yes install open-iscsi
+        sudo apt-get --yes install nfs-common
+
+- name: install Helm
+  hosts: masters
+  become: yes
+  tasks:
+    - name: install helm from apt
+      become: yes
+      become_user: devops
+      shell: |
+        curl https://baltocdn.com/helm/signing.asc | sudo apt-key add -
+        sudo apt-get install apt-transport-https --yes
+        echo "deb https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+        sudo apt-get update
+        sudo apt-get --yes install helm
+        helm repo add bitnami https://charts.bitnami.com/bitnami
+        helm repo add longhorn https://charts.longhorn.io
+        helm repo update
+        helm install longhorn longhorn/longhorn --namespace longhorn-system --create-namespace
+        helm repo add metallb https://metallb.github.io/metallb
+        helm install metallb metallb/metallb
